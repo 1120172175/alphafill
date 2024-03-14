@@ -3,6 +3,14 @@
 //       (See accompanying file LICENSE_1_0.txt or copy at
 //             http://www.boost.org/LICENSE_1_0.txt)
 
+#include "blast.hpp"
+#include "matrix.hpp"
+
+#include <boost/interprocess/file_mapping.hpp>
+#include <boost/interprocess/mapped_region.hpp>
+
+#include <cif++.hpp>
+
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -12,14 +20,6 @@
 #include <cmath>
 #include <map>
 #include <atomic>
-
-#include <boost/interprocess/file_mapping.hpp>
-#include <boost/interprocess/mapped_region.hpp>
-
-#include <cif++.hpp>
-
-#include "blast.hpp"
-#include "matrix.hpp"
 
 namespace fs = std::filesystem;
 
@@ -1206,6 +1206,10 @@ void Hit::Cleanup(int64_t inSearchSpace, double inLambda, double inLogKappa, dou
 		remove_if(mHsps.begin(), mHsps.end(), [=](const BlastHsp &hsp) -> bool
 			{ return hsp.mExpect > inExpect; }),
 		mHsps.end());
+
+	// support for Windows OS...
+	if (mDefLine.back() == '\r')
+		mDefLine.pop_back();
 }
 
 // --------------------------------------------------------------------
@@ -1511,8 +1515,8 @@ void BlastQuery<WORDSIZE>::WriteAsFasta(std::ostream &inStream)
 			seq += kResidues[r];
 		}
 
-		inStream << hit->mDefLine << std::endl
-				 << seq << std::endl;
+		inStream << hit->mDefLine << '\n'
+				 << seq << '\n';
 	}
 }
 

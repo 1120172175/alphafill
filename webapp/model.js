@@ -30,8 +30,6 @@ function updateModel(viewer, cbs, showAllCB) {
 		a.classList.toggle('invisible', selected.length != 1 || a.getAttribute('data-asym-id') != selected[0]);
 	});
 
-	// selected.push('A');
-	
 	return viewer.loadStructureFromUrl(`v1/aff/${AF_ID}/stripped/${selected.join(',')}/${IDENTITY}`);
 }
 
@@ -103,5 +101,36 @@ window.addEventListener('load', () => {
 	
 		window.location = `v1/aff/${AF_ID}/stripped/${selected.join(',')}/${IDENTITY}`;
 	});
+
+	// // Update PAE matrices
+	// const cv = [...document.querySelectorAll("td.pae-matrix canvas")];
+	// cv.forEach(c => {
+	// 	const ctx = c.getContext("2d");
+
+	// 	const pae = JSON.parse(c.getAttribute("data-pae"));
+		
+	// 	const dim = Math.sqrt(pae.length);
+	// 	const scale = 32.0 / dim;
+
+	// 	ctx.scale(scale, scale);
+
+	// 	let i = 0;
+	// 	for (let x = 0; x < dim; ++x)
+	// 	{
+	// 		for (let y = 0; y < dim; ++y)
+	// 		{
+	// 			const v = 1.0 * pae[i];
+	// 			i += 1;
+
+	// 			console.log(v);
+				
+	// 			const clr = `hsl(220,60%,${Math.round(25 + 50 * (v / 32.0))}%)`;
+
+	// 			ctx.fillStyle = clr;
+	// 			ctx.fillRect(x, y, 1, 1);
+	// 		}
+	// 	}
+	// });
+
 
 })

@@ -71,7 +71,7 @@ bool Ligand::drops(const std::string &atomID) const
 	bool result = false;
 
 	if (mModifications != nullptr)
-		result = mModifications->exists("atom1"_key == atomID and "atom2"_key == cif::null);
+		result = mModifications->contains("atom1"_key == atomID and "atom2"_key == cif::null);
 
 	return result;
 }
@@ -91,5 +91,22 @@ std::string Ligand::map(const std::string &atomID) const
 		}
 	}
 	
+	return result;
+}
+
+bool LigandsTable::contains_any(const std::vector<std::string_view> &compounds) const
+{
+	bool result = false;
+
+	for (auto compound_id : compounds)
+	{
+		Ligand l{ &mCifFile[compound_id] };
+		if (l)
+		{
+			result = true;
+			break;
+		}
+	}
+
 	return result;
 }

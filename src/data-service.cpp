@@ -39,8 +39,6 @@
 #include <zeep/http/uri.hpp>
 #include <zeep/json/parser.hpp>
 
-#include "mrsrc.hpp"
-
 #include "alphafill.hpp"
 #include "data-service.hpp"
 #include "db-connection.hpp"
@@ -49,61 +47,6 @@
 #include "utilities.hpp"
 
 namespace fs = std::filesystem;
-
-// --------------------------------------------------------------------
-
-std::regex kAF_ID_Rx(R"((?:(AF|CS)-)?(.+?)(?:-F(\d+)(?:-model_v(\d))?)?)");
-
-std::tuple<EntryType, std::string, int, int> parse_af_id(std::string af_id)
-{
-	auto &data_service = data_service::instance();
-
-	EntryType type = EntryType::Unknown;
-	int chunkNr = 1, version = 2;
-	std::string id;
-
-	std::smatch m;
-	if (std::regex_match(af_id, m, kAF_ID_Rx))
-	{
-		id = m[2];
-
-		if (m[3].matched)
-			chunkNr = std::stoi(m[3]);
-
-		if (m[4].matched)
-			version = std::stoi(m[4]);
-
-		if (m[1].matched)
-		{
-			if (m[1] == "CS")
-				type = EntryType::Custom;
-			else if (m[1] == "AF")
-				type = EntryType::AlphaFold;
-		}
-		else
-		{
-			// No prefix was given, try to see if we can find this ID in our cache
-			for (version = 2;; ++version)
-			{
-				auto test = file_locator::get_metadata_file(id, chunkNr, version);
-
-				if (fs::exists(test))
-				{
-					type = EntryType::AlphaFold;
-					break;
-				}
-
-				if (not fs::exists(test.parent_path().parent_path()))
-					break;
-			}
-
-			if (type != EntryType::AlphaFold and data_service.get_status(id).status != CustomStatus::Unknown)
-				type = EntryType::Custom;
-		}
-	}
-
-	return { type, id, chunkNr, version };
-}
 
 // --------------------------------------------------------------------
 
@@ -117,7 +60,7 @@ data_service::data_service()
 {
 	auto &config = mcfp::config::instance();
 
-	fs::path dir = config.get<std::string>("custom-dir");
+	fs::path dir = config.get("custom-dir");
 	m_in_dir = dir / "in";
 	m_out_dir = dir / "out";
 	m_work_dir = dir / "work";
@@ -130,18 +73,47 @@ data_service::data_service()
 
 	if (not fs::is_directory(m_work_dir))
 		fs::create_directories(m_work_dir);
+}
 
-	m_thread = std::thread(std::bind(&data_service::run, this));
-	m_thread_3db = std::thread(std::bind(&data_service::run_3db, this));
+void data_service::start_queue(size_t nr_of_threads)
+{
+	for (size_t i = 0; i < nr_of_threads; ++i)
+		m_threads.emplace_back(std::bind(&data_service::run, this));
+
+	std::lock_guard<std::mutex> lock(m_mutex);
+	std::regex rx(R"(((?:AF|CS)-.+?)(?:\.cif\.gz))");
+
+	std::vector<std::string> files_in_in;
+	for (fs::directory_iterator iter(m_in_dir); iter != fs::directory_iterator(); ++iter)
+	{
+		std::smatch m;
+
+		std::string name = iter->path().filename();
+		if (not std::regex_match(name, m, rx))
+			continue;
+
+		files_in_in.push_back(m[1]);
+	}
+
+	if (not files_in_in.empty())
+	{
+		std::thread pushThread([this, files = files_in_in]()
+			{
+			for (auto &file : files)
+				this->m_queue.push(file); });
+		pushThread.detach();
+	}
 }
 
 data_service::~data_service()
 {
 	m_queue.push("stop");
-	m_thread.join();
 
-	m_queue_3db.push("stop");
-	m_thread_3db.join();
+	for (auto &t : m_threads)
+	{
+		if (t.joinable())
+			t.join();
+	}
 }
 
 std::vector<compound> data_service::get_compounds(float min_identity) const
@@ -291,6 +263,8 @@ using json = zeep::json::element;
 
 void process(blocking_queue<json> &q, cif::progress_bar &p)
 {
+	pqxx::transaction tx1(db_connection::instance());
+
 	for (;;)
 	{
 		auto data = q.pop();
@@ -304,7 +278,6 @@ void process(blocking_queue<json> &q, cif::progress_bar &p)
 		const auto &[type, uniprot_id, chunk, version] = parse_af_id(id);
 		bool chunked = fs::exists(file_locator::get_metadata_file(type, uniprot_id, 2, version));
 
-		pqxx::transaction tx1(db_connection::instance());
 		auto r = tx1.exec1(R"(INSERT INTO af_structure (name, chunked, af_version, created, af_file) VALUES()" +
 						   tx1.quote(id) + "," +
 						   tx1.quote(chunked) + "," +
@@ -315,20 +288,20 @@ void process(blocking_queue<json> &q, cif::progress_bar &p)
 
 		int64_t structure_id = r[0].as<int64_t>();
 
-		for (auto &alignment : data["hits"])
+		for (auto &hit : data["hits"])
 		{
 			r = tx1.exec1(R"(INSERT INTO af_pdb_hit (af_id, identity, length, pdb_asym_id, pdb_id, rmsd) VALUES ()" +
 						  std::to_string(structure_id) + ", " +
-						  std::to_string(alignment["identity"].as<double>()) + ", " +
-						  std::to_string(alignment["alignment_length"].as<int64_t>()) + ", " +
-						  tx1.quote(alignment["pdb_asym_id"].as<std::string>()) + ", " +
-						  tx1.quote(alignment["pdb_id"].as<std::string>()) + ", " +
-						  std::to_string(alignment["rmsd"].as<double>()) +
+						  std::to_string(hit["alignment"]["identity"].as<double>()) + ", " +
+						  std::to_string(hit["alignment"]["length"].as<int64_t>()) + ", " +
+						  tx1.quote(hit["pdb_asym_id"].as<std::string>()) + ", " +
+						  tx1.quote(hit["pdb_id"].as<std::string>()) + ", " +
+						  std::to_string(hit["global_rmsd"].as<double>()) +
 						  ")  RETURNING id");
 
 			int64_t hit_id = r.front().as<int64_t>();
 
-			for (auto &transplant : alignment["transplants"])
+			for (auto &transplant : hit["transplants"])
 			{
 				tx1.exec0(R"(INSERT INTO af_transplant (hit_id, asym_id, compound_id, analogue_id, entity_id, rmsd) VALUES ()" +
 						  std::to_string(hit_id) + ", " +
@@ -336,49 +309,38 @@ void process(blocking_queue<json> &q, cif::progress_bar &p)
 						  tx1.quote(transplant["compound_id"].as<std::string>()) + ", " +
 						  tx1.quote(transplant["analogue_id"].as<std::string>()) + ", " +
 						  tx1.quote(transplant["entity_id"].as<std::string>()) + ", " +
-						  std::to_string(alignment["rmsd"].as<double>()) +
+						  std::to_string(transplant["local_rmsd"].as<double>()) +
 						  ")");
 			}
 		}
 
-		tx1.commit();
-
 		p.consumed(1);
 	}
+
+	tx1.commit();
 }
 
 // --------------------------------------------------------------------
 
 int data_service::rebuild(const std::string &db_user, const fs::path &db_dir)
 {
+	auto &config = mcfp::config::instance();
+
 	pqxx::work tx(db_connection::instance());
 
-#if USE_RSRC
-	mrsrc::rsrc schema("db-schema.sql");
+	auto schema = cif::load_resource("db-schema.sql");
 	if (not schema)
-		throw std::runtime_error("database schema not found, did you include the resource?");
+		throw std::runtime_error("database schema not found (looking for db-schema.sql)");
 
-	std::string s(schema.data(), schema.size());
+	std::ostringstream os;
+	os << schema->rdbuf();
+
+	std::string s(os.str());
 
 	cif::replace_all(s, "$OWNER", db_user);
 
 	tx.exec0(s);
 	tx.commit();
-#else
-	try
-	{
-		auto r = tx.exec1("select count(*) from af_structure");
-		tx.commit();
-
-		if (r.front().as<uint32_t>() > 0)
-			throw std::runtime_error("not empty");
-	}
-	catch (const std::exception &e)
-	{
-		std::cerr << "Not built using resources, please create and/or empty the tables manually before running rebuild-db" << std::endl;
-		exit(1);
-	}
-#endif
 
 	std::vector<fs::path> files;
 	for (auto di = fs::recursive_directory_iterator(db_dir); di != fs::recursive_directory_iterator(); ++di)
@@ -389,31 +351,69 @@ int data_service::rebuild(const std::string &db_user, const fs::path &db_dir)
 	}
 
 	cif::progress_bar progress(files.size(), "Processing");
-	blocking_queue<json> q;
+	blocking_queue<fs::path> q1;
+	blocking_queue<json> q2;
 	std::exception_ptr ep;
 
-	std::thread t([&q, &progress, &ep]()
+	std::thread t([&q2, &progress, &ep]()
 		{
 		try
 		{
-			process(q, progress);
+			process(q2, progress);
 		}
 		catch (const std::exception &ex)
 		{
 			ep = std::current_exception();
 		} });
 
-	for (auto &f : files)
+	std::vector<std::thread> tg;
+	size_t thread_count = config.get<size_t>("threads");
+	if (thread_count < 1)
+		thread_count = 1;
+
+	for (size_t i = 0; i < thread_count; ++i)
 	{
-		std::ifstream file(f);
+		tg.emplace_back([&q1, &q2, &ep]()
+			{
+			for (;;)
+			{
+				auto f = q1.pop();
 
-		zeep::json::element data;
-		zeep::json::parse_json(file, data);
+				if (f.empty())
+					break;
 
-		q.push(std::move(data));
+				try
+				{
+					std::ifstream file(f);
+
+					zeep::json::element data;
+					zeep::json::parse_json(file, data);
+
+					q2.push(std::move(data));
+				}
+				catch (const std::exception &ex)
+				{
+					ep = std::current_exception();
+				}
+			}
+
+			q1.push({}); });
 	}
 
-	q.push({});
+	for (auto &f : files)
+	{
+		if (ep)
+			std::rethrow_exception(ep);
+
+		q1.push(std::move(f));
+	}
+
+	q1.push({});
+
+	for (auto &ti : tg)
+		ti.join();
+
+	q2.push({});
 
 	t.join();
 
@@ -431,7 +431,7 @@ bool data_service::exists_in_afdb(const std::string &id) const
 
 	auto &config = mcfp::config::instance();
 
-	std::string url = config.get<std::string>("alphafold-3d-beacon");
+	std::string url = config.get("alphafold-3d-beacon");
 
 	std::string::size_type i;
 	while ((i = url.find("${id}")) != std::string::npos)
@@ -454,11 +454,11 @@ bool data_service::exists_in_afdb(const std::string &id) const
 	return result;
 }
 
-std::tuple<std::filesystem::path, std::string> data_service::fetch_from_afdb(const std::string &id) const
+std::tuple<std::filesystem::path, std::string, std::string> data_service::fetch_from_afdb(const std::string &id) const
 {
 	auto &config = mcfp::config::instance();
 
-	std::string url = config.get<std::string>("alphafold-3d-beacon");
+	std::string url = config.get("alphafold-3d-beacon");
 
 	std::string::size_type i;
 	while ((i = url.find("${id}")) != std::string::npos)
@@ -473,6 +473,11 @@ std::tuple<std::filesystem::path, std::string> data_service::fetch_from_afdb(con
 	zeep::json::parse_json(rep.get_content(), rep_j);
 
 	url = rep_j["structures"][0]["summary"]["model_url"].as<std::string>();
+
+	zeep::http::uri uri(url);
+
+	if (uri.get_path().get_segments().empty())
+		throw std::runtime_error("Empy uri returned");
 
 	rep = simple_request(url, { { "Accept-Encoding", "gzip" } });
 
@@ -497,17 +502,51 @@ std::tuple<std::filesystem::path, std::string> data_service::fetch_from_afdb(con
 	cif::gzio::istream in(&buffer);
 
 	std::ostringstream result;
+	result << in.rdbuf();
 
-	std::string line;
-	while (getline(in, line))
-		result << line << std::endl;
+	std::ostringstream pae_data;
 
-	zeep::http::uri uri(url);
+	// Try PAE data
+	auto o = url.find("-model_v");
+	if (o != std::string::npos)
+	{
+		url.replace(o + 1, 5, "predicted_aligned_error");
 
-	if (uri.get_path().get_segments().empty())
-		throw std::runtime_error("Empy uri returned");
+		o = url.rfind(".cif");
+		if (o != std::string::npos)
+			url.replace(o + 1, 3, "json");
 
-	return { uri.get_path().get_segments().back(), result.str() };
+		rep = simple_request(url, { { "Accept-Encoding", "gzip" } });
+
+		try
+		{
+			if (rep.get_status() != zeep::http::ok)
+				throw std::runtime_error("Could not download PAE data");
+
+			std::string enc = rep.get_header("Content-Encoding");
+			if (enc != "gzip")
+				throw std::runtime_error("Unexpected content encoding from server");
+
+			const std::string &content = rep.get_content();
+
+			struct membuf : public std::streambuf
+			{
+				membuf(char *text, size_t length)
+				{
+					this->setg(text, text, text + length);
+				}
+			} buffer(const_cast<char *>(content.data()), content.length());
+
+			cif::gzio::istream in(&buffer);
+			pae_data << in.rdbuf();
+		}
+		catch (const std::exception &ex)
+		{
+			std::cerr << "Error loading PAE data from " << std::quoted(url) << ": " << ex.what() << '\n';
+		}
+	}
+
+	return { uri.get_path().get_segments().back(), result.str(), pae_data.str() };
 }
 
 // --------------------------------------------------------------------
@@ -552,7 +591,7 @@ struct data_service_progress : public alphafill_progress_cb
 // recursively print exception whats:
 void print_what(std::ostream &os, const std::exception &e)
 {
-	os << e.what() << std::endl;
+	os << e.what() << '\n';
 	try
 	{
 		std::rethrow_if_nested(e);
@@ -564,12 +603,13 @@ void print_what(std::ostream &os, const std::exception &e)
 	}
 }
 
-void data_service::process_queued(const std::filesystem::path &xyzin, const std::filesystem::path &xyzout, const std::filesystem::path &jsonout)
+void data_service::process_queued(const std::filesystem::path &xyzin, const std::filesystem::path &paein,
+	const std::filesystem::path &xyzout, const std::filesystem::path &jsonout)
 {
 	std::error_code ec;
 
 	if (not fs::exists(xyzin, ec))
-		throw std::runtime_error("Input file does not exist");
+		throw std::runtime_error("Input file '" + xyzin.string() + "' does not exist");
 
 	cif::file f(xyzin);
 	if (f.empty())
@@ -578,98 +618,77 @@ void data_service::process_queued(const std::filesystem::path &xyzin, const std:
 	m_progress = 0;
 
 	if (cif::VERBOSE > 0)
-		std::cerr << "Running ID " << m_running << std::endl;
+		std::cerr << "Running ID " << m_running << '\n';
 
 	fs::rename(xyzin, m_work_dir / xyzin.filename(), ec);
 	if (ec)
-		std::cerr << "Error moving input file to work dir: " << ec.message() << std::endl;
+		std::cerr << "Error moving input file to work dir: " << ec.message() << '\n';
 
-	auto metadata = alphafill(f.front(), data_service_progress{ m_progress });
+	std::vector<PAE_matrix> pae_data;
 
-	f.save(xyzout);
+	if (not paein.empty() and fs::exists(paein))
+	{
+		pae_data = load_pae_from_file(paein);
+		fs::rename(paein, m_work_dir / paein.filename(), ec);
+	}
+
+	auto metadata = alphafill(f.front(), pae_data, data_service_progress{ m_progress });
+
+	try
+	{
+		f.save(xyzout);
+	}
+	catch (const std::exception &ex)
+	{
+		std::cerr << "Error writing output file " << std::quoted(xyzout.string()) << ": " << ex.what() << '\n';
+		throw;
+	}
 
 	std::ofstream metadataFile(jsonout);
 	metadataFile << metadata;
 
-	fs::remove(m_work_dir / xyzin.filename(), ec);
-	if (ec)
-		std::cerr << "Error removing input file from work dir: " << ec.message() << std::endl;
+	// Clean up work files
+	if (fs::exists(m_work_dir / xyzin.filename(), ec))
+		fs::remove(m_work_dir / xyzin.filename(), ec);
 
-	// int pid = fork();
-
-	// if (pid < 0)
-	// 	throw std::runtime_error("Could not fork: "s + std::strerror(errno));
-
-	// if (pid == 0)	// child
-	// {
-	// 	try
-	// 	{
-	// 		auto metadata = alphafill(f.front(), data_service_progress{ m_progress });
-
-	// 		f.save(xyzout);
-
-	// 		std::ofstream metadataFile(jsonout);
-	// 		metadataFile << metadata;
-
-	// 		exit(0);
-	// 	}
-	// 	catch (const std::exception &ex)
-	// 	{
-	// 		std::ofstream errorFile(m_out_dir / ("CS-" + next + ".error"));
-	// 		errorFile << ex.what() << std::endl;
-	// 		exit(1);
-	// 	}
-	// }
-
-	// int status = 0;
-	// int err = waitpid(pid, &status, 0);
-
-	// if (err != 0)
-	// 	throw std::runtime_error("Wait failed with error "s + std::strerror(errno));
-
-	// if (WIFEXITED(status) and WEXITSTATUS(status) != 0)
-	// 	throw std::runtime_error("Alphafill terminated with exit status " + std::to_string(WEXITSTATUS(status)));
-
-	// if (WIFSIGNALED(status))
-	// 	throw std::runtime_error("Alphafill terminated with signal " + std::to_string(WTERMSIG(status)));
+	if (not paein.empty() and fs::exists(m_work_dir / paein.filename(), ec))
+		fs::remove(m_work_dir / paein.filename(), ec);
 }
 
 void data_service::run()
 {
 	using namespace std::literals;
-	std::regex rx(R"(((?:AF|CS)-.+?)(?:\.cif\.gz)?)");
+	using namespace date;
+	using namespace std::chrono;
 
 	for (;;)
 	{
 		std::error_code ec;
-		std::filesystem::path xyzin;
+		std::filesystem::path xyzin, paein;
 
-		auto &&[timeout, next] = m_queue.pop(5s);
+		auto next = m_queue.pop();
 
-		if (timeout)	// nothing in the queue, see if there's something left in m_in_dir
+		if (next == "stop")
 		{
-			std::lock_guard<std::mutex> lock(m_mutex);
-
-			for (fs::directory_iterator iter(m_in_dir); iter != fs::directory_iterator(); ++iter)
-			{
-				std::smatch m;
-
-				std::string name = iter->path().filename();
-				if (not std::regex_match(name, m, rx))
-					continue;
-
-				xyzin = *iter;
-				next = m[1].str();
-				break;
-			}
-
-			if (xyzin.empty())
-				continue;
-		}
-		else if (next == "stop")
+			m_queue.push(next);
 			break;
-		else
-			xyzin = m_in_dir / (next + ".cif.gz");
+		}
+
+		xyzin = m_in_dir / (next + ".cif.gz");
+
+		// Skip if it does not exist
+		if (not fs::exists(xyzin))
+		{
+			std::clog << system_clock::now() << " requested ID '" << next << "' does not resolve to filename (tried: " << xyzin.string() << ")\n";
+			continue;
+		}
+
+		paein = xyzin;
+
+		if (paein.extension() == ".gz")
+			paein.replace_extension();
+		if (paein.extension() == ".cif")
+			paein.replace_extension("pae.gz");
 
 		const auto &[type, afId, chunkNr, version] = parse_af_id(next);
 		fs::path jsonout = file_locator::get_metadata_file(type, afId, chunkNr, version);
@@ -679,6 +698,8 @@ void data_service::run()
 		{
 			// results already exist. Skip this.
 			fs::remove(xyzin, ec);
+			if (not paein.empty())
+				fs::remove(paein, ec);
 			continue;
 		}
 
@@ -686,19 +707,18 @@ void data_service::run()
 
 		try
 		{
-			process_queued(xyzin, xyzout, jsonout);
+			std::clog << system_clock::now() << ' ' << "process: " << xyzin.string() << '\n';
+			process_queued(xyzin, paein, xyzout, jsonout);
 		}
 		catch (const std::exception &ex)
 		{
+			std::clog << system_clock::now() << ' ' << ex.what() << '\n';
 			std::ofstream errorFile(m_out_dir / (next + ".error"));
 			print_what(errorFile, ex);
 		}
 
 		m_progress = 0;
 		m_running.clear();
-
-		if (fs::exists(xyzin, ec))
-			fs::remove(xyzin, ec);
 	}
 }
 
@@ -707,7 +727,7 @@ status_reply data_service::get_status(const std::string &af_id) const
 	status_reply reply;
 
 	EntryType type = EntryType::Unknown;
-	int chunkNr = 1, version = 2;
+	int chunkNr = 1, version = 4;
 	std::string id;
 
 	std::smatch m;
@@ -733,12 +753,12 @@ status_reply data_service::get_status(const std::string &af_id) const
 	fs::path jsonFile = file_locator::get_metadata_file(type, id, chunkNr, version);
 	fs::path cifFile = file_locator::get_structure_file(type, id, chunkNr, version);
 
-	// See if this ID might have been processed already
-	if ((not fs::exists(jsonFile) or not fs::exists(cifFile)) and not m[4].matched)
-	{
-		jsonFile = file_locator::get_metadata_file(type, id, chunkNr, 3);
-		cifFile = file_locator::get_structure_file(type, id, chunkNr, 3);
-	}
+	// // See if this ID might have been processed already
+	// if ((not fs::exists(jsonFile) or not fs::exists(cifFile)) and not m[4].matched)
+	// {
+	// 	jsonFile = file_locator::get_metadata_file(type, id, chunkNr, 3);
+	// 	cifFile = file_locator::get_structure_file(type, id, chunkNr, 3);
+	// }
 
 	if (fs::exists(jsonFile) and fs::exists(cifFile))
 		reply.status = CustomStatus::Finished;
@@ -766,7 +786,7 @@ status_reply data_service::get_status(const std::string &af_id) const
 	return reply;
 }
 
-void data_service::queue(const std::string &data, const std::string &id)
+void data_service::queue(const std::string &data, const std::optional<std::string> pae, const std::string &id)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -795,6 +815,19 @@ void data_service::queue(const std::string &data, const std::string &id)
 	f.save(out);
 	out.close();
 
+	if (pae.has_value())
+	{
+		membuf b2(const_cast<char *>(pae->data()), pae->length());
+		cif::gzio::istream in(&b2);
+
+		cif::gzio::ofstream out(m_in_dir / (id + ".pae.gz"));
+		if (not out.is_open())
+			throw std::runtime_error("Could not create temporary file");
+
+		out << in.rdbuf();
+		out.close();
+	}
+
 	m_queue.push(id);
 }
 
@@ -803,25 +836,38 @@ std::string data_service::queue_af_id(const std::string &id)
 	if (m_queue.is_full())
 		throw std::runtime_error("The server is too busy to handle your request, please try again later");
 
-	auto &&[filename, data] = fetch_from_afdb(id);
+	auto &&[filename, data, pae] = fetch_from_afdb(id);
 
 	if (filename.extension() == ".cif")
-		filename.replace_extension("");
-
-	const auto &[type, af_id, chunk, version] = parse_af_id(filename);
-
-	auto outfile = file_locator::get_structure_file(af_id, chunk, version);
+		filename.replace_extension();
 
 	std::lock_guard<std::mutex> lock(m_mutex);
 
-	cif::gzio::ofstream out(m_in_dir / outfile.filename());
+	cif::gzio::ofstream out(m_in_dir / (filename.string() + ".cif.gz"));
 	if (not out.is_open())
 		throw std::runtime_error("Could not create temporary file");
 
 	out << data;
 	out.close();
 
+	if (not pae.empty())
+	{
+		auto paefile = m_in_dir / filename;
+		paefile.replace_extension().replace_extension("pae.gz");
+
+		cif::gzio::ofstream out(m_in_dir / paefile.filename());
+		if (not out.is_open())
+			throw std::runtime_error("Could not create temporary PAE file");
+
+		out << pae;
+		out.close();
+	}
+
 	// create output directory, if needed.
+
+	const auto &[type, af_id, chunk, version] = parse_af_id(filename);
+	auto outfile = file_locator::get_structure_file(af_id, chunk, version);
+
 	assert(not outfile.empty());
 	if (not fs::exists(outfile.parent_path()))
 		fs::create_directories(outfile.parent_path());
@@ -829,53 +875,4 @@ std::string data_service::queue_af_id(const std::string &id)
 	m_queue.push(filename.string());
 
 	return filename.string();
-}
-
-void data_service::queue_3d_beacon_request(const std::string &id)
-{
-	if (not m_queue_3db.push(id))
-		std::cerr << "Not queuing " << id << " since queue is full" << std::endl;
-}
-
-void data_service::run_3db()
-{
-	using namespace std::literals;
-
-	for (;;)
-	{
-		if (m_queue.is_full())
-		{
-			std::this_thread::sleep_for(60s);
-			continue;
-		}
-
-		auto id = m_queue_3db.pop();
-		if (id == "stop")
-			break;
-
-		try
-		{
-			auto &&[filename, data] = fetch_from_afdb(id);
-
-			if (filename.extension() == ".cif")
-				filename.replace_extension("");
-
-			const auto &[type, af_id, chunk, version] = parse_af_id(filename);
-
-			auto outfile = file_locator::get_structure_file(af_id, chunk, version);
-
-			std::lock_guard<std::mutex> lock(m_mutex);
-
-			cif::gzio::ofstream out(m_in_dir / outfile.filename());
-			if (not out.is_open())
-				throw std::runtime_error("Could not create temporary file");
-
-			out << data;
-			out.close();
-		}
-		catch (const std::exception &ex)
-		{
-			std::cerr << "queuing 3d beacon request failed: " << ex.what() << std::endl;
-		}
-	}
 }

@@ -28,19 +28,13 @@
 
 #include <atomic>
 #include <filesystem>
+#include <thread>
 
 #include <zeep/nvp.hpp>
 
+#include <cif++.hpp>
+
 #include "queue.hpp"
-
-// --------------------------------------------------------------------
-
-enum class EntryType { Unknown, AlphaFold, Custom };
-
-/// \brief Return the UniprotID and chunk number for an AlphaFold ID.
-///
-/// Split an id in the form of AF-UNIPROTID-F<CHUNKNR>-model_v<VERSION>
-std::tuple<EntryType,std::string,int,int> parse_af_id(std::string af_id);
 
 // --------------------------------------------------------------------
 
@@ -57,7 +51,6 @@ struct compound
 	{
 		ar & zeep::make_nvp("id", id)
 		   & zeep::make_nvp("analogue", analogue)
-		//    & zeep::make_nvp("name", name)
 		   & zeep::make_nvp("structure-count", count_structures)
 		   & zeep::make_nvp("transplant-count", count_transplants);
 	}
@@ -107,6 +100,8 @@ class data_service
 
 	~data_service();
 
+	void start_queue(size_t nr_of_threads);
+
 	static int rebuild(const std::string &db_user, const std::filesystem::path &db_dir);
 
 	std::vector<compound> get_compounds(float min_identity) const;
@@ -119,34 +114,29 @@ class data_service
 	// On demand services
 
 	bool exists_in_afdb(const std::string &id) const;
-	std::tuple<std::filesystem::path,std::string> fetch_from_afdb(const std::string &id) const;
+	std::tuple<std::filesystem::path,std::string,std::string> fetch_from_afdb(const std::string &id) const;
 
 	status_reply get_status(const std::string &id) const;
 
-	void queue(const std::string &data, const std::string &id);
+	void queue(const std::string &data, const std::optional<std::string> pae, const std::string &id);
 	std::string queue_af_id(const std::string &id);
-	void queue_3d_beacon_request(const std::string &id);
 
   private:
 
 	data_service();
 
 	void run();
-	void run_3db();
 
-	void process_queued(const std::filesystem::path &xyzin, const std::filesystem::path &xyzout, const std::filesystem::path &jsonout);
+	void process_queued(const std::filesystem::path &xyzin, const std::filesystem::path &paein,
+		const std::filesystem::path &xyzout, const std::filesystem::path &jsonout);
 
 	std::filesystem::path m_in_dir;
 	std::filesystem::path m_out_dir;
 	std::filesystem::path m_work_dir;
 
-	// thread processing AF entries
-	std::thread m_thread;
-	blocking_queue<std::string,10> m_queue;
-
-	// thread processing 3d-beacon requests
-	std::thread m_thread_3db;
-	non_blocking_queue<std::string,100> m_queue_3db;
+	// threads processing AF entries
+	std::vector<std::thread> m_threads;
+	blocking_queue<std::string,100> m_queue;
 
 	std::mutex m_mutex;
 	std::string m_running;

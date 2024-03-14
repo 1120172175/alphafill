@@ -44,8 +44,6 @@
 #include <zeep/http/reply.hpp>
 #include <zeep/json/parser.hpp>
 
-#include "mrsrc.hpp"
-
 #include "bsd-closefrom.h"
 
 #include "data-service.hpp"
@@ -87,7 +85,7 @@ void stripCifFile(const std::string &af_id, std::set<std::string> requestedAsyms
 
 		for (auto &hit : data["hits"])
 		{
-			float hi = hit["identity"].as<float>();
+			float hi = hit["alignment"]["identity"].as<float>();
 			if (hi >= identity * 0.01f)
 				continue;
 
@@ -223,7 +221,7 @@ json optimizeWithYasara(const std::string &af_id, std::set<std::string> requeste
 	using namespace std::literals;
 
 	auto &config = mcfp::config::instance();
-	auto yasara = config.get<std::string>("yasara");
+	auto yasara = config.get("yasara");
 
 	static std::atomic<int> sYasaraRunNr = 1;
 
@@ -238,10 +236,10 @@ json optimizeWithYasara(const std::string &af_id, std::set<std::string> requeste
 
 	std::string script_s = (tmpdir / "refine.mcr").c_str();
 	std::ofstream script(script_s);
-	mrsrc::istream r_script("refine.mcr");
+	auto r_script = cif::load_resource("refine.mcr");
 	if (not r_script)
-		throw std::runtime_error("Missing resource");
-	script << r_script.rdbuf();
+		throw std::runtime_error("Missing resource refine.mcr");
+	script << r_script->rdbuf();
 	script.close();
 
 	std::string modelin = ("modelin='" + (tmpdir / "input.cif").string() + "'");
@@ -367,7 +365,7 @@ json optimizeWithYasara(const std::string &af_id, std::set<std::string> requeste
 	if (status != 0)
 	{
 		std::stringstream msg;
-		msg << "Error executing yasara, exit code is: " << status << std::endl;
+		msg << "Error executing yasara, exit code is: " << status << '\n';
 
 		if (fs::exists(tmpdir / "errorexit.txt"))
 		{

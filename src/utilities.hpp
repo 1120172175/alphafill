@@ -24,26 +24,39 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <filesystem>
-#include <regex>
+#include "blast.hpp"
+#include "ligands.hpp"
 
 #include <cif++.hpp>
 #include <mcfp/mcfp.hpp>
 
-#include "blast.hpp"
-#include "ligands.hpp"
-#include "data-service.hpp"
+#include <filesystem>
+#include <regex>
+
+// --------------------------------------------------------------------
+
+enum class EntryType { Unknown, AlphaFold, Custom };
+
+/// \brief Return the UniprotID and chunk number for an AlphaFold ID.
+///
+/// Split an id in the form of AF-UNIPROTID-F<CHUNKNR>-(model|filled)_v<VERSION>
+std::tuple<EntryType,std::string,int,int> parse_af_id(std::string af_id);
 
 // --------------------------------------------------------------------
 
 std::filesystem::path pdbFileForID(const std::filesystem::path &pdbDir, std::string pdb_id);
 std::vector<cif::mm::residue *> get_residuesForAsymID(cif::mm::structure &structure, const std::string &asym_id);
-std::vector<cif::mm::residue *> get_residuesForChainID(cif::mm::structure &structure, const std::string &chain_id);
+std::vector<cif::mm::residue *> get_residues_for_chain_id(cif::mm::structure &structure, const std::string &chain_id);
+std::vector<std::string> get_chain_ids_for_entity_id(const cif::datablock &db, const std::string &entity_id);
 std::tuple<std::vector<cif::point>, std::vector<cif::point>> selectAtomsNearResidue(
 	const std::vector<cif::mm::residue *> &pdb, const std::vector<size_t> &pdb_ix,
 	const std::vector<cif::mm::residue *> &af, const std::vector<size_t> &af_ix,
 	const std::vector<cif::mm::atom> &residue, float maxDistance, const Ligand &ligand);
 sequence getSequenceForStrand(cif::datablock &db, const std::string &strand);
+
+extern std::regex kAF_ID_Rx;
+
+std::vector<cif::matrix<uint8_t>> load_pae_from_file(const std::filesystem::path &file);
 
 // --------------------------------------------------------------------
 
@@ -71,7 +84,7 @@ class file_locator
 		if (type == EntryType::Custom)
 			return instance().m_custom_dir / ("CS-" + id + ".json");
 		else
-			return instance().m_custom_dir / ("AF-" + id + "-F" + std::to_string(chunk_nr) + "-model_v" + std::to_string(version) + ".json");
+			return instance().m_custom_dir / ("AF-" + id + "-F" + std::to_string(chunk_nr) + "-filled_v" + std::to_string(version) + ".json");
 	}
 
 	static std::filesystem::path get_structure_file(const std::string &id, int chunk_nr, int version)
@@ -109,7 +122,7 @@ class file_locator
 
 		std::string::size_type i;
 		while ((i = s.find("${db-dir}")) != std::string::npos)
-			s.replace(i, strlen("${db-dir}"), m_db_dir);
+			s.replace(i, strlen("${db-dir}"), m_db_dir.string());
 
 		while ((i = s.find("${version}")) != std::string::npos)
 			s.replace(i, strlen("${version}"), std::to_string(version));
@@ -123,7 +136,7 @@ class file_locator
 
 		std::string::size_type i;
 		while ((i = s.find("${db-dir}")) != std::string::npos)
-			s.replace(i, strlen("${db-dir}"), m_db_dir);
+			s.replace(i, strlen("${db-dir}"), m_db_dir.string());
 		
 		while ((i = s.find("${version}")) != std::string::npos)
 			s.replace(i, strlen("${version}"), std::to_string(version));
@@ -133,11 +146,11 @@ class file_locator
 
 	std::filesystem::path get_pdb_file_1(const std::string &id)
 	{
-		std::string s = get_file(id, 0, m_pdb_name_pattern);
+		std::string s = get_file(cif::to_lower_copy(id), 0, m_pdb_name_pattern);
 
 		std::string::size_type i;
 		while ((i = s.find("${pdb-dir}")) != std::string::npos)
-			s.replace(i, strlen("${pdb-dir}"), m_pdb_dir);
+			s.replace(i, strlen("${pdb-dir}"), m_pdb_dir.string());
 		
 		return s;
 	}
@@ -166,8 +179,8 @@ class file_locator
 		return pattern;
 	}
 
-	const std::filesystem::path m_db_dir, m_pdb_dir, m_custom_dir;
-	const std::string m_structure_name_pattern;
-	const std::string m_pdb_name_pattern;
-	const std::string m_metadata_name_pattern;
+	std::filesystem::path m_db_dir, m_pdb_dir, m_custom_dir;
+	std::string m_structure_name_pattern;
+	std::string m_pdb_name_pattern;
+	std::string m_metadata_name_pattern;
 };

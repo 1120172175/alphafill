@@ -24,8 +24,14 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <filesystem>
-#include <iostream>
+#include "server.hpp"
+#include "alphafill.hpp"
+#include "data-service.hpp"
+#include "db-connection.hpp"
+#include "ligands.hpp"
+#include "main.hpp"
+#include "structure.hpp"
+#include "utilities.hpp"
 
 #include <zeep/crypto.hpp>
 #include <zeep/http/daemon.hpp>
@@ -37,17 +43,13 @@
 #include <cif++.hpp>
 #include <mcfp/mcfp.hpp>
 
-#include "data-service.hpp"
-#include "db-connection.hpp"
-#include "ligands.hpp"
-#include "server.hpp"
-#include "structure.hpp"
-#include "utilities.hpp"
+#include <filesystem>
+#include <iostream>
 
 namespace fs = std::filesystem;
 namespace zh = zeep::http;
 
-const std::array<uint32_t, 6> kIdentities{70, 60, 50, 40, 30, 25};
+const std::array<uint32_t, 6> kIdentities{ 70, 60, 50, 40, 30, 25 };
 
 const int
 	kPageSize = 20,
@@ -81,7 +83,7 @@ class af_link_template_object : public zh::expression_utility_object<af_link_tem
 				std::regex rx(R"([0-9][0-9a-z]{3}(?:\.[a-z]+))", std::regex_constants::icase);
 
 				if (std::regex_match(id, rx))
-					id.erase(4, std::string::npos);
+					id.erase(4);
 
 				auto url = m_template;
 				std::string::size_type s;
@@ -92,7 +94,7 @@ class af_link_template_object : public zh::expression_utility_object<af_link_tem
 			}
 			catch (const std::exception &e)
 			{
-				std::cerr << "Error getting post by ID: " << e.what() << std::endl;
+				std::cerr << "Error getting post by ID: " << e.what() << '\n';
 			}
 		}
 
@@ -165,6 +167,9 @@ class affd_html_controller : public zh::html_controller
 		mount("favicon.ico", &affd_html_controller::handle_file);
 
 		mount("structure-table-page", &affd_html_controller::structures_table);
+
+		mount("{manual,man,genindex}/", &affd_html_controller::handle_help_file);
+		mount("_static/", &affd_html_controller::handle_file);
 	}
 
 	void welcome(const zh::request &request, const zh::scope &scope, zh::reply &reply);
@@ -177,6 +182,7 @@ class affd_html_controller : public zh::html_controller
 	void schema(const zh::request &request, const zh::scope &scope, zh::reply &reply);
 
 	void structures_table(const zh::request &request, const zh::scope &scope, zh::reply &reply);
+	void handle_help_file(const zh::request &request, const zh::scope &scope, zh::reply &reply);
 };
 
 void affd_html_controller::welcome(const zh::request &request, const zh::scope &scope, zh::reply &reply)
@@ -310,6 +316,9 @@ struct transplant_info
 	std::string asym_id;
 	double clashScore;
 	double lRMSd;
+	std::vector<uint8_t> pae;
+	double paeMean;
+	double paeSD;
 	bool firstHit = false;
 	bool firstTransplant = false;
 	int hitCount = 1;
@@ -318,7 +327,21 @@ struct transplant_info
 	template <typename Archive>
 	void serialize(Archive &ar, unsigned long)
 	{
-		ar &zeep::make_nvp("compound_id", compound_id) & zeep::make_nvp("analogue_id", analogue_id) & zeep::make_nvp("pdb_id", pdb_id) & zeep::make_nvp("identity", identity) & zeep::make_nvp("global-rmsd", gRMSd) & zeep::make_nvp("asym_id", asym_id) & zeep::make_nvp("local-rmsd", lRMSd) & zeep::make_nvp("clash-score", clashScore) & zeep::make_nvp("first-hit", firstHit) & zeep::make_nvp("first-transplant", firstTransplant) & zeep::make_nvp("hit-count", hitCount) & zeep::make_nvp("transplant-count", transplantCount);
+		ar &zeep::make_nvp("compound_id", compound_id)             //
+			& zeep::make_nvp("analogue_id", analogue_id)           //
+			& zeep::make_nvp("pdb_id", pdb_id)                     //
+			& zeep::make_nvp("identity", identity)                 //
+			& zeep::make_nvp("global-rmsd", gRMSd)                 //
+			& zeep::make_nvp("asym_id", asym_id)                   //
+			& zeep::make_nvp("local-rmsd", lRMSd)                  //
+			& zeep::make_nvp("pae", pae)                           //
+			& zeep::make_nvp("pae-mean", paeMean)                  //
+			& zeep::make_nvp("pae-sd", paeSD)                      //
+			& zeep::make_nvp("clash-score", clashScore)            //
+			& zeep::make_nvp("first-hit", firstHit)                //
+			& zeep::make_nvp("first-transplant", firstTransplant)  //
+			& zeep::make_nvp("hit-count", hitCount)                //
+			& zeep::make_nvp("transplant-count", transplantCount); //
 	}
 
 	bool operator<(const transplant_info &rhs) const
@@ -374,10 +397,10 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 			}
 
 			throw missing_entry_error(af_id);
-		
+
 		case CustomStatus::Finished:
 			break;
-		
+
 		case CustomStatus::Error:
 		{
 			const auto &[type, afId, chunkNr, version] = parse_af_id(af_id);
@@ -385,7 +408,7 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 
 			sub.put("error-id", af_id);
 			sub.put("error", status.message.value_or("<< message is missing >>"));
-			
+
 			get_template_processor().create_reply_from_template("index", sub, reply);
 			return;
 		}
@@ -396,7 +419,7 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 			get_template_processor().create_reply_from_template("wait", sub, reply);
 			return;
 	}
-	
+
 	const auto &[type, afId, chunkNr, version] = parse_af_id(af_id);
 
 	fs::path jsonFile = file_locator::get_metadata_file(type, afId, chunkNr, version);
@@ -448,7 +471,7 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 		{
 			for (auto &hit : data["hits"])
 			{
-				if (hit["identity"].as<double>() * 100 < i)
+				if (hit["alignment"]["identity"].as<double>() * 100 < i)
 					continue;
 
 				identity = i;
@@ -466,23 +489,36 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 	std::vector<transplant_info> transplants;
 	for (auto &hit : data["hits"])
 	{
-		double hitIdentity = hit["identity"].as<double>();
+		double hitIdentity = hit["alignment"]["identity"].as<double>();
 		if (hitIdentity * 100 < identity)
 			continue;
 
 		++hit_nr;
 		for (auto &transplant : hit["transplants"])
 		{
+			std::vector<uint8_t> pae;
+			if (transplant["pae"].is_object() and transplant["pae"]["matrix"].is_array())
+			{
+				for (auto &row : transplant["pae"]["matrix"])
+				{
+					for (auto &f : row)
+						pae.push_back(f.as<uint8_t>());
+				}
+			}
+
 			transplants.emplace_back(transplant_info{
 				transplant["compound_id"].as<std::string>(),
 				transplant["analogue_id"].as<std::string>(),
 				hit_nr,
 				hit["pdb_id"].as<std::string>() + '.' + hit["pdb_asym_id"].as<std::string>(),
 				hitIdentity,
-				hit["rmsd"].as<double>(),
+				hit["global_rmsd"].as<double>(),
 				transplant["asym_id"].as<std::string>(),
 				transplant["clash"]["score"].as<double>(),
-				transplant["rmsd"].as<double>()});
+				transplant["local_rmsd"].as<double>(),
+				std::move(pae),
+				transplant["pae"]["mean"].as<double>(),
+				transplant["pae"]["stddev"].as<double>() });
 		}
 	}
 
@@ -541,8 +577,8 @@ void affd_html_controller::model(const zh::request &request, const zh::scope &sc
 	// 11.43, 3.04 voor global, en 3.10 en 0.92 voor local
 	sub.put("cutoff", json{
 						  // {"global", {{"unreliable", 11.43}, {"suspect", 3.04}}},
-						  {"local", {{"unreliable", 3.10}, {"suspect", 0.92}}},
-						  {"tcs", {{"unreliable", 1.27}, {"suspect", 0.64}}}});
+						  { "local", { { "unreliable", 3.10 }, { "suspect", 0.92 } } },
+						  { "tcs", { { "unreliable", 1.27 }, { "suspect", 0.64 } } } });
 
 	get_template_processor().create_reply_from_template("model", sub, reply);
 }
@@ -624,6 +660,18 @@ void affd_html_controller::schema(const zh::request &request, const zh::scope &s
 		reply.set_header("Content-Disposition", R"(attachment; filename="alphafill.json.schema")");
 }
 
+void affd_html_controller::handle_help_file(const zh::request &request, const zh::scope &scope, zh::reply &reply)
+{
+	zh::scope sub(scope);
+
+	fs::path file = scope["baseuri"].as<std::string>();
+	file /= "index.html";
+
+	sub.put("baseuri", file.string());
+
+	return get_template_processor().create_reply_from_template(file, sub, reply);
+}
+
 // --------------------------------------------------------------------
 
 class affd_rest_controller : public zh::rest_controller
@@ -644,7 +692,7 @@ class affd_rest_controller : public zh::rest_controller
 		map_get_request("aff/{id}/optimized/{asymlist}", &affd_rest_controller::get_aff_structure_optimized, "id", "asymlist");
 		map_get_request("aff/{id}/optimized-with-stats/{asymlist}", &affd_rest_controller::get_aff_structure_optimized_with_stats, "id", "asymlist");
 
-		map_post_request("aff", &affd_rest_controller::post_custom_structure, "structure");
+		map_post_request("aff", &affd_rest_controller::post_custom_structure, "structure", "pae");
 	}
 
 	zh::reply get_aff_structure(const std::string &af_id);
@@ -653,19 +701,19 @@ class affd_rest_controller : public zh::rest_controller
 	zeep::json::element get_aff_structure_json(const std::string &af_id);
 	zeep::json::element get_aff_3d_beacon(std::string id, std::string version);
 
-	zh::reply get_aff_structure_stripped_def(const std::string &id, const std::string &asyms)
+	zh::reply get_aff_structure_stripped_def(const std::string &id, const std::optional<std::string> &asyms)
 	{
 		return get_aff_structure_stripped(id, asyms, 0);
 	}
 
-	zh::reply get_aff_structure_stripped(const std::string &af_id, const std::string &asyms, int identity);
+	zh::reply get_aff_structure_stripped(const std::string &af_id, const std::optional<std::string> &asyms, int identity);
 
 	zh::reply get_aff_structure_optimized(const std::string &af_id, const std::string &asyms);
 	zh::reply get_aff_structure_optimized_with_stats(const std::string &af_id, const std::string &asyms);
 
 	// --------------------------------------------------------------------
 
-	zeep::json::element post_custom_structure(const std::string &data);
+	zeep::json::element post_custom_structure(const std::string &data, const std::optional<std::string> pae);
 };
 
 status_reply affd_rest_controller::get_aff_status(const std::string &af_id)
@@ -682,14 +730,14 @@ status_reply affd_rest_controller::get_aff_status(const std::string &af_id)
 
 zh::reply affd_rest_controller::get_aff_structure(const std::string &af_id)
 {
-	zeep::http::reply rep(zeep::http::ok, {1, 1});
+	zeep::http::reply rep(zeep::http::ok, { 1, 1 });
 
 	const auto &[type, id, chunkNr, version] = parse_af_id(af_id);
 
 	fs::path file = file_locator::get_structure_file(type, id, chunkNr, version);
 
 	if (not fs::exists(file))
-		return zeep::http::reply(zeep::http::not_found, {1, 1});
+		return zeep::http::reply(zeep::http::not_found, { 1, 1 });
 
 	if (get_header("accept-encoding").find("gzip") != std::string::npos)
 	{
@@ -701,8 +749,8 @@ zh::reply affd_rest_controller::get_aff_structure(const std::string &af_id)
 		cif::gzio::ifstream in(file);
 
 		if (not in.is_open())
-			return zeep::http::reply(zeep::http::not_found, {1, 1});
-		
+			return zeep::http::reply(zeep::http::not_found, { 1, 1 });
+
 		std::ostringstream os;
 		os << in.rdbuf();
 
@@ -715,12 +763,16 @@ zh::reply affd_rest_controller::get_aff_structure(const std::string &af_id)
 	return rep;
 }
 
-zh::reply affd_rest_controller::get_aff_structure_stripped(const std::string &af_id, const std::string &asyms, int identity)
+zh::reply affd_rest_controller::get_aff_structure_stripped(const std::string &af_id, const std::optional<std::string> &asyms, int identity)
 {
-	zeep::http::reply rep(zeep::http::ok, {1, 1});
+	zeep::http::reply rep(zeep::http::ok, { 1, 1 });
 
-	auto requestedAsyms = cif::split(asyms, ",");
-	std::set<std::string> requestedAsymSet{ requestedAsyms.begin(), requestedAsyms.end() };
+	std::set<std::string> requestedAsymSet;
+	if (asyms.has_value())
+	{
+		auto requestedAsyms = cif::split(*asyms, ",");
+		requestedAsymSet = { requestedAsyms.begin(), requestedAsyms.end() };
+	}
 
 	std::unique_ptr<std::iostream> s(new std::stringstream);
 
@@ -748,7 +800,7 @@ zh::reply affd_rest_controller::get_aff_structure_stripped(const std::string &af
 		auto filename = file.filename();
 		if (filename.extension() == ".gz")
 			filename.replace_extension("");
-		
+
 		rep.set_header("content-disposition", "attachement; filename = \"" + filename.string() + "\"");
 	}
 
@@ -757,7 +809,7 @@ zh::reply affd_rest_controller::get_aff_structure_stripped(const std::string &af
 
 zh::reply affd_rest_controller::get_aff_structure_optimized(const std::string &af_id, const std::string &asyms)
 {
-	zeep::http::reply rep(zeep::http::ok, {1, 1});
+	zeep::http::reply rep(zeep::http::ok, { 1, 1 });
 
 	auto requestedAsyms = cif::split(asyms, ",");
 	std::set<std::string> requestedAsymSet{ requestedAsyms.begin(), requestedAsyms.end() };
@@ -784,7 +836,7 @@ zh::reply affd_rest_controller::get_aff_structure_optimized(const std::string &a
 
 zh::reply affd_rest_controller::get_aff_structure_optimized_with_stats(const std::string &af_id, const std::string &asyms)
 {
-	zeep::http::reply rep(zeep::http::ok, {1, 1});
+	zeep::http::reply rep(zeep::http::ok, { 1, 1 });
 
 	auto requestedAsyms = cif::split(asyms, ",");
 	std::set<std::string> requestedAsymSet{ requestedAsyms.begin(), requestedAsyms.end() };
@@ -847,19 +899,20 @@ zeep::json::element affd_rest_controller::get_aff_3d_beacon(std::string af_id, s
 
 	if (not fs::exists(file))
 	{
-		auto &data_service = data_service::instance();
-		data_service.queue_3d_beacon_request(id);
+		// Disabled due to too many requests
+		// auto &data_service = data_service::instance();
+		// data_service.queue_3d_beacon_request(id);
 
 		throw zeep::http::not_found;
 	}
 
-	int version_major = 1, version_minor = 0;
+	int version_major = 1 /* , version_minor = 0 */;
 	std::smatch m;
 	if (std::regex_match(version_3dbeacons, m, KVersionRX))
 	{
 		version_major = std::stoi(m[1]);
-		if (m.length() >= 2)
-			version_minor = std::stoi(m[2]);
+		// if (m.length() >= 2)
+		// 	version_minor = std::stoi(m[2]);
 	}
 
 	using namespace std::chrono;
@@ -887,24 +940,26 @@ zeep::json::element affd_rest_controller::get_aff_3d_beacon(std::string af_id, s
 	std::string db_code = struct_ref.front()["db_code"].as<std::string>();
 
 	zeep::json::element result{
-		{"uniprot_entry", {{"ac", id},
-							  {"id", db_code},
-							  {"sequence_length", uniprot_end - uniprot_start + 1}}}};
+		{ "uniprot_entry", { //
+							   { "ac", id },
+							   { "id", db_code },
+							   { "sequence_length", uniprot_end - uniprot_start + 1 } } }
+	};
 
 	if (version_major >= 2)
 	{
 		zeep::json::element summary{
-			{"model_identifier", id},
-			{"model_category", "TEMPLATE-BASED"},
-			{"model_url", "https://alphafill.eu/v1/aff/" + id},
-			{"model_format", "MMCIF"},
-			{"model_page_url", "https://alphafill.eu/model?id=" + id},
-			{"provider", "AlphaFill"},
-			{"created", ss.str()},
-			{"sequence_identity", 1.0},
-			{"uniprot_start", uniprot_start},
-			{"uniprot_end", uniprot_end},
-			{"coverage", 1.0},
+			{ "model_identifier", id },
+			{ "model_category", "TEMPLATE-BASED" },
+			{ "model_url", "https://alphafill.eu/v1/aff/" + id },
+			{ "model_format", "MMCIF" },
+			{ "model_page_url", "https://alphafill.eu/model?id=" + id },
+			{ "provider", "AlphaFill" },
+			{ "created", ss.str() },
+			{ "sequence_identity", 1.0 },
+			{ "uniprot_start", uniprot_start },
+			{ "uniprot_end", uniprot_end },
+			{ "coverage", 1.0 },
 		};
 
 		auto &entities = summary["entities"];
@@ -914,17 +969,17 @@ zeep::json::element affd_rest_controller::get_aff_3d_beacon(std::string af_id, s
 		{
 			if (type == "polymer")
 			{
-				entities.push_back({{"entity_type", "POLYMER"},
-					{"entity_poly_type", "POLYPEPTIDE(L)"},
-					{"description", description}});
+				entities.push_back({ { "entity_type", "POLYMER" },
+					{ "entity_poly_type", "POLYPEPTIDE(L)" },
+					{ "description", description } });
 				entities.back()["chain_ids"].push_back("A");
 				continue;
 			}
 
 			if (type == "non-polymer")
 			{
-				entities.push_back({{"entity_type", "NON-POLYMER"},
-					{"description", description}});
+				entities.push_back({ { "entity_type", "NON-POLYMER" },
+					{ "description", description } });
 
 				auto &chain_ids = entities.back()["chain_ids"];
 
@@ -935,21 +990,21 @@ zeep::json::element affd_rest_controller::get_aff_3d_beacon(std::string af_id, s
 			}
 		}
 
-		result["structures"].push_back({{"summary", summary}});
+		result["structures"].push_back({ { "summary", summary } });
 	}
 	else
 	{
-		result["structures"].push_back({{"model_identifier", id},
-			{"model_category", "DEEP-LEARNING"},
-			{"model_url", "https://alphafill.eu/v1/aff/" + id},
-			{"model_page_url", "https://alphafill.eu/model?id=" + id},
-			{"model_format", "MMCIF"},
-			{"provider", "AlphaFill"},
-			{"created", ss.str()},
-			{"sequence_identity", 1.0},
-			{"coverage", 1.0},
-			{"uniprot_start", uniprot_start},
-			{"uniprot_end", uniprot_end}});
+		result["structures"].push_back({ { "model_identifier", id },
+			{ "model_category", "DEEP-LEARNING" },
+			{ "model_url", "https://alphafill.eu/v1/aff/" + id },
+			{ "model_page_url", "https://alphafill.eu/model?id=" + id },
+			{ "model_format", "MMCIF" },
+			{ "provider", "AlphaFill" },
+			{ "created", ss.str() },
+			{ "sequence_identity", 1.0 },
+			{ "coverage", 1.0 },
+			{ "uniprot_start", uniprot_start },
+			{ "uniprot_end", uniprot_end } });
 	}
 
 	return result;
@@ -957,7 +1012,7 @@ zeep::json::element affd_rest_controller::get_aff_3d_beacon(std::string af_id, s
 
 // --------------------------------------------------------------------
 
-zeep::json::element affd_rest_controller::post_custom_structure(const std::string &data)
+zeep::json::element affd_rest_controller::post_custom_structure(const std::string &data, const std::optional<std::string> pae)
 {
 	auto id = "CS-" + zeep::encode_hex(zeep::sha1(data));
 
@@ -965,7 +1020,7 @@ zeep::json::element affd_rest_controller::post_custom_structure(const std::strin
 
 	if (status.status == CustomStatus::Unknown)
 	{
-		data_service::instance().queue(data, id);
+		data_service::instance().queue(data, pae, id);
 		status.status = CustomStatus::Queued;
 	}
 
@@ -977,135 +1032,172 @@ zeep::json::element affd_rest_controller::post_custom_structure(const std::strin
 
 // --------------------------------------------------------------------
 
-int rebuild_db_main(int argc, char * const argv[])
-{
-	using namespace std::literals;
-
-	auto &config = mcfp::config::instance();
-
-	fs::path dbDir = config.get<std::string>("db-dir");
-
-	std::vector<std::string> vConn;
-	std::string db_user;
-	for (std::string opt : {"db-host", "db-port", "db-dbname", "db-user", "db-password"})
-	{
-		if (not config.has(opt))
-			continue;
-
-		vConn.push_back(opt.substr(3) + "=" + config.get<std::string>(opt));
-		if (opt == "db-user")
-			db_user = config.get<std::string>(opt);
-	}
-
-	db_connection::init(cif::join(vConn, " "));
-
-	// --------------------------------------------------------------------
-
-	return data_service::rebuild(db_user, dbDir);
-}
-
-// --------------------------------------------------------------------
-
 int server_main(int argc, char *const argv[])
 {
 	using namespace std::literals;
 
+	auto &config = load_and_init_config(
+		R"(usage: alphafill server <command> [options]
+
+  where command is one of:
+
+    start          Start a new webserver instance
+    stop           Stop the currently running webserver instance
+    status         Report the status of a currently running webserver
+    reload         Reload the configuration, re-open log files and restart
+                   the currently running webserver
+)",
+
+		mcfp::make_option<std::string>("db-dir", "Directory containing the alphafilled data"),
+		mcfp::make_option<std::string>("pdb-dir", "Directory containing the mmCIF files for the PDB"),
+
+		mcfp::make_option<std::string>("pdb-fasta", "The FastA file containing the PDB sequences"),
+
+		mcfp::make_option<std::string>("ligands", "af-ligands.cif", "File in CIF format describing the ligands and their modifications"),
+
+		mcfp::make_option<float>("max-ligand-to-backbone-distance", 6, "The max distance to use to find neighbouring backbone atoms for the ligand in the AF structure"),
+		mcfp::make_option<float>("min-hsp-identity", 0.25, "The minimal identity for a high scoring pair (note, value between 0 and 1)"),
+		mcfp::make_option<int>("min-alignment-length", 85, "The minimal length of an alignment"),
+		mcfp::make_option<float>("min-separation-distance", 3.5, "The centroids of two identical ligands should be at least this far apart to count as separate occurrences"),
+		mcfp::make_option<uint32_t>("blast-report-limit", 250, "Number of blast hits to use"),
+
+		mcfp::make_option<std::string>("blast-matrix", "BLOSUM62", "Blast matrix to use"),
+		mcfp::make_option<int>("blast-word-size", 3, "Blast word size"),
+		mcfp::make_option<double>("blast-expect", 10, "Blast expect cut off"),
+		mcfp::make_option("blast-no-filter", "Blast option for filter, default is to use low complexity filter"),
+		mcfp::make_option("blast-no-gapped", "Blast option for gapped, default is to do gapped"),
+		mcfp::make_option<int>("blast-gap-open", 11, "Blast penalty for gap open"),
+		mcfp::make_option<int>("blast-gap-extend", 1, "Blast penalty for gap extend"),
+
+		mcfp::make_option<float>("clash-distance-cutoff", 4, "The max distance between polymer atoms and ligand atoms used in calculating clash scores"),
+
+		mcfp::make_option<float>("max-ligand-to-polymer-atom-distance", 6,
+			"The max distance to use to find neighbouring polymer atoms for the ligand in the AF structure (for validation)"),
+
+		mcfp::make_option<std::string>("structure-name-pattern", "${db-dir}/${id:0:2}/AF-${id}-F${chunk}-filled_v${version}.cif.gz", "Pattern for locating structure files"),
+		mcfp::make_option<std::string>("metadata-name-pattern", "${db-dir}/${id:0:2}/AF-${id}-F${chunk}-filled_v${version}.cif.json", "Pattern for locating metadata files"),
+		mcfp::make_option<std::string>("pdb-name-pattern", "${pdb-dir}/${id:1:2}/${id}/${id}_final.cif", "Pattern for locating PDB files"),
+
+		mcfp::make_option<size_t>("threads,t", std::thread::hardware_concurrency(), "Number of threads to use, zero means all available cores"),
+
+		mcfp::make_option<std::string>("alphafold-3d-beacon", "https://www.ebi.ac.uk/pdbe/pdbe-kb/3dbeacons/api/uniprot/summary/${id}.json?provider=alphafold",
+			"The URL of the 3d-beacons service for alphafold"),
+
+		mcfp::make_option("no-daemon,F", "Do not fork a background process"),
+		mcfp::make_option<std::string>("address", "127.0.0.1", "Address to listen to"),
+		mcfp::make_option<unsigned short>("port", 10342, "Port to listen to"),
+		mcfp::make_option<std::string>("user", "www-data", "User to run as"),
+		mcfp::make_option<std::string>("context", "Reverse proxy context"),
+		mcfp::make_option<std::string>("db-link-template", "Template for links to pdb(-redo) entry"),
+
+		mcfp::make_option<std::string>("db-dbname", "AF DB name"),
+		mcfp::make_option<std::string>("db-user", "AF DB owner"),
+		mcfp::make_option<std::string>("db-password", "AF DB password"),
+		mcfp::make_option<std::string>("db-host", "AF DB host"),
+		mcfp::make_option<std::string>("db-port", "AF DB port"),
+
+		mcfp::make_option<std::string>("custom-dir", (fs::temp_directory_path() / "alphafill").string(), "Directory for custom built entries"),
+
+		mcfp::make_option<std::string>("yasara", "/opt/yasara/yasara", "Location of the yasara executable, needed for optimising")
+
+	);
+
+	parse_argv(argc, argv, config);
+
+	// --------------------------------------------------------------------
+
+	check_blast_index();
+
+	if (not config.has("db-dir"))
+	{
+		std::cout << "Data directory not specified\n";
+		return 1;
+	}
+
 	int result = 0;
 
-	zeep::value_serializer<CustomStatus>::instance("CustomStatus")
-		("unknown", CustomStatus::Unknown)
-		("queued", CustomStatus::Queued)
-		("running", CustomStatus::Running)
-		("finished", CustomStatus::Finished)
+	zeep::value_serializer<CustomStatus>::instance("CustomStatus") //
+		("unknown", CustomStatus::Unknown)                         //
+		("queued", CustomStatus::Queued)                           //
+		("running", CustomStatus::Running)                         //
+		("finished", CustomStatus::Finished)                       //
 		("error", CustomStatus::Error);
 
-	zeep::value_serializer<EntryType>::instance("EntryType")
-		("unknown", EntryType::Unknown)
-		("alphafold", EntryType::AlphaFold)
+	zeep::value_serializer<EntryType>::instance("EntryType") //
+		("unknown", EntryType::Unknown)                      //
+		("alphafold", EntryType::AlphaFold)                  //
 		("custom", EntryType::Custom);
 
-	auto &config = mcfp::config::instance();
-
-	fs::path dbDir = config.get<std::string>("db-dir");
-
-	LigandsTable::init(config.get<std::string>("ligands"));
+	LigandsTable::init(config.get("ligands"));
 
 	std::vector<std::string> vConn;
 	std::string db_user;
-	for (std::string opt : {"db-host", "db-port", "db-dbname", "db-user", "db-password"})
+	for (std::string opt : { "db-host", "db-port", "db-dbname", "db-user", "db-password" })
 	{
 		if (not config.has(opt))
 			continue;
 
-		vConn.push_back(opt.substr(3) + "=" + config.get<std::string>(opt));
+		vConn.push_back(opt.substr(3) + "=" + config.get(opt));
 		if (opt == "db-user")
-			db_user = config.get<std::string>(opt);
+			db_user = config.get(opt);
 	}
 
 	db_connection::init(cif::join(vConn, " "));
 
 	// --------------------------------------------------------------------
 
-	if (config.operands().size() < 2)
+	if (config.operands().size() != 1)
 	{
-		std::cout << "No command specified, use of of start, stop, status or reload" << std::endl;
+		std::cout << "No command specified, use of of start, stop, status or reload\n";
 		exit(1);
 	}
 
 	// --------------------------------------------------------------------
 
 	if (config.has("db-link-template"))
-		s_af_object.set_template(config.get<std::string>("db-link-template"));
+		s_af_object.set_template(config.get("db-link-template"));
 
-	std::string command = config.operands()[1];
+	std::string command = config.operands().front();
 
-	zh::daemon server([&]()
-	{
-		// auto sc = new zh::security_context(secret, ibs_user_service::instance());
-		// sc->add_rule("/admin", { "ADMIN" });
-		// sc->add_rule("/admin/**", { "ADMIN" });
-		// sc->add_rule("/media,/media/**", { "ADMIN", "EDITOR" });
-		// sc->add_rule("/", {});
+	zh::daemon server([&, nr_of_threads = config.get<size_t>("threads")]() mutable
+		{
 
-		/* auto &ds = */ data_service::instance();
+		auto &ds = data_service::instance();
+
+		if (nr_of_threads == 0)
+			nr_of_threads = std::thread::hardware_concurrency();
+
+		ds.start_queue(nr_of_threads);
 
 		auto s = new zeep::http::server(/*sc*/);
 
 		if (config.has("context"))
-			s->set_context_name(config.get<std::string>("context"));
+			s->set_context_name(config.get("context"));
 
 		s->add_error_handler(new db_error_handler());
 		s->add_error_handler(new missing_entry_error_handler());
 
-#ifndef NDEBUG
+#if not defined(NDEBUG)
 		s->set_template_processor(new zeep::http::file_based_html_template_processor("docroot"));
-#else
+#elif defined(WEBAPP_USES_RESOURCES) and WEBAPP_USES_RESOURCES
 		s->set_template_processor(new zeep::http::rsrc_based_html_template_processor());
+#else
+		s->set_template_processor(new zeep::http::file_based_html_template_processor(ALPHAFILL_DATA_DIR "/docroot"));
 #endif
-		// s->add_controller(new zh::login_controller());
-		// s->add_controller(new user_admin_rest_controller());
 
 		s->add_controller(new affd_html_controller());
 		s->add_controller(new affd_rest_controller());
 
-		return s;
-	}, "alphafill");
+		return s; },
+		"alphafill");
 
 	if (command == "start")
 	{
-		std::string address = "127.0.0.1";
-		if (config.has("address"))
-			address = config.get<std::string>("address");
+		std::string address = config.get("address");
+		unsigned short port = config.get<unsigned short>("port");
+		std::string user = config.get("user");
 
-		unsigned short port = 10342;
-		if (config.has("port"))
-			port = config.get<unsigned short>("port");
-
-		std::string user = "www-data";
-		if (config.has("user"))
-			user = config.get<std::string>("user");
-
-		std::cout << "starting server at http://" << address << ':' << port << '/' << std::endl;
+		std::cout << "starting server at http://" << address << ':' << port << '/' << '\n';
 
 		if (config.has("no-daemon"))
 			result = server.run_foreground(address, port);
@@ -1120,7 +1212,7 @@ int server_main(int argc, char *const argv[])
 		result = server.reload();
 	else
 	{
-		std::cerr << "Invalid command" << std::endl;
+		std::cerr << "Invalid command " << std::quoted(command) << "\n";
 		result = 1;
 	}
 
