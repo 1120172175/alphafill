@@ -306,6 +306,7 @@ zeep::json::element alphafill(cif::datablock &db, alphafill_progress_cb &&progre
 
 	auto &config = mcfp::config::instance();
 
+	// fasta是所有候选蛋白的sequence
 	std::string fasta = config.get<std::string>("pdb-fasta");
 	fs::path pdbDir = config.get<std::string>("pdb-dir");
 
@@ -398,6 +399,7 @@ zeep::json::element alphafill(cif::datablock &db, alphafill_progress_cb &&progre
 		if (threads == 0)
 			threads = std::thread::hardware_concurrency();
 
+		// seq是输入的sequence，result是匹配上的同源蛋白，匹配的是输入参数中fasta里面的序列，共有241w个蛋白
 		auto result = BlastP(fasta, seq, "BLOSUM62", 3, 10, true, true, 11, 1, config.get<uint32_t>("blast-report-limit"), threads);
 
 		if (cif::VERBOSE > 0)
